@@ -105,7 +105,7 @@ python validate.py
 
 ```bash
 export API_BASE_URL="https://router.huggingface.co/v1"
-export MODEL_NAME="openai/gpt-4.1-mini"
+export MODEL_NAME="nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"
 export HF_TOKEN="<your_hf_token>"
 
 # checker-compatible root script (must be named inference.py at repo root)
