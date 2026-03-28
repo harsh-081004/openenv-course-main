@@ -15,6 +15,7 @@ description = "My Env environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
+    "openenv-core>=0.2.0",
     "openai>=1.50.0",
     "pydantic>=2.6.0",
     "pyyaml>=6.0.1",
