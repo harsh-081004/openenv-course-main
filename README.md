@@ -101,15 +101,18 @@ curl -s -X POST http://localhost:7860/baseline
 python validate.py
 ```
 
-### 4. Baseline Inference (No API Key Needed)
+### 4. Inference Script (Mandatory Env + OpenAI Client)
 
 ```bash
+export API_BASE_URL="https://router.huggingface.co/v1"
+export MODEL_NAME="openai/gpt-4.1-mini"
+export HF_TOKEN="<your_hf_token>"
 
-# checker-compatible root script
+# checker-compatible root script (must be named inference.py at repo root)
 python inference.py --base-url http://localhost:7860
 ```
 
-Baseline is deterministic and evaluates each task on a fixed set of emails, then averages per-email scores.
+The root inference script uses OpenAI Client for all LLM calls and reads `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` from environment variables.
 
 ### 5. Docker Build and Run
 
