@@ -13,7 +13,7 @@ from typing import Dict, List
 from fastapi import FastAPI
 
 try:
-    from ..baseline.inference import run_baseline
+    from inference import run_baseline
     from ..environment import EmailTriageEnvironment
     from ..models import (
         EmailAction,
@@ -25,7 +25,7 @@ try:
     )
     from ..tasks import TASKS
 except ImportError:
-    from baseline.inference import run_baseline
+    from inference import run_baseline
     from environment import EmailTriageEnvironment
     from models import EmailAction, GraderRequest, GraderResponse, ResetRequest, StepResponse, TaskInfo
     from tasks import TASKS

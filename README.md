@@ -104,7 +104,9 @@ python validate.py
 ### 4. Baseline Inference (No API Key Needed)
 
 ```bash
-python -m baseline.inference
+
+# checker-compatible root script
+python inference.py --base-url http://localhost:7860
 ```
 
 Baseline is deterministic and evaluates each task on a fixed set of emails, then averages per-email scores.
@@ -181,15 +183,14 @@ my_env/
   openenv.yaml
   requirements.txt
   README.md
+  inference.py
   validate.py
   models.py
   tasks.py
   graders.py
   environment.py
-  baseline/
-    inference.py
+  inference.py
   server/
     app.py
-    Dockerfile
     requirements.txt
 ```
