@@ -34,6 +34,31 @@ except ImportError:
 app = FastAPI(title="Email Triage Environment", version="1.0.0")
 env = EmailTriageEnvironment()
 
+TASK_GRADER_SPECS: Dict[str, Dict[str, object]] = {
+    "task-urgency": {
+        "name": "grade_task1",
+        "endpoint": "/grader",
+        "method": "POST",
+        "score_type": "exact_match",
+        "required_action_fields": ["urgency"],
+    },
+    "task-routing": {
+        "name": "grade_task2",
+        "endpoint": "/grader",
+        "method": "POST",
+        "score_type": "exact_or_partial_match",
+        "required_action_fields": ["department"],
+    },
+    "task-full-triage": {
+        "name": "grade_task3",
+        "endpoint": "/grader",
+        "method": "POST",
+        "score_type": "weighted_composite",
+        "weights": {"urgency": 0.3, "department": 0.3, "summary": 0.4},
+        "required_action_fields": ["urgency", "department", "summary"],
+    },
+}
+
 
 @app.get("/")
 def health_check() -> Dict[str, str]:
@@ -77,12 +102,22 @@ def tasks() -> Dict[str, object]:
             difficulty=task.difficulty,
             objective=task.objective,
             description=task.description,
+            grader_name=TASK_GRADER_SPECS.get(task.task_id, {}).get("name", "grade_task3"),
+            has_grader=True,
+            grader_endpoint="/grader",
+            grader={
+                "task_id": task.task_id,
+                **TASK_GRADER_SPECS.get(task.task_id, {"name": "grade_task3", "endpoint": "/grader"}),
+            },
         )
         for task in TASKS
     ]
+    grader_count = sum(1 for task in task_infos if task.has_grader and bool(task.grader))
     return {
         "tasks": [task.model_dump() for task in task_infos],
         "action_schema": EmailAction.model_json_schema(),
+        "grader_endpoint": "/grader",
+        "graded_task_count": grader_count,
     }
 
 
