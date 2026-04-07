@@ -36,6 +36,10 @@ SYSTEM_PROMPT = (
     "queue_position in {1,2,3}; escalate as boolean."
 )
 
+DEFAULT_MODEL_NAME = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
+MAX_EMAILS_PER_TASK = int(os.getenv("MAX_EMAILS_PER_TASK", "0"))
+
 
 def get_required_llm_env() -> Tuple[str, str, str]:
     api_base_url = os.getenv("API_BASE_URL")
@@ -66,6 +70,9 @@ def run_inference(base_url: str, client: Any, model_name: str) -> Dict[str, floa
 
     for task_id in ["task-urgency", "task-routing", "task-full-triage"]:
         email_ids = all_email_ids or TASK_EMAIL_MAP[task_id]
+        if MAX_EMAILS_PER_TASK > 0:
+            email_ids = email_ids[:MAX_EMAILS_PER_TASK]
+        print(f"Evaluating {task_id} on {len(email_ids)} emails...", flush=True)
         per_email_scores = [
             _evaluate_task_on_email(
                 base_url=base_url,
@@ -138,11 +145,18 @@ def _run_heuristic_baseline(base_url: str) -> Dict[str, float]:
         email_ids = all_email_ids or TASK_EMAIL_MAP[task_id]
         per_email_scores = []
         for email_id in email_ids:
-            observation = _reset_env(base_url, task_id, email_id)
-            action = _heuristic_action(observation)
-            _step_env(base_url, action)
-            per_email_scores.append(_grade_env(base_url, task_id, action))
-        scores[task_id] = sum(per_email_scores) / len(per_email_scores)
+            try:
+                observation = _reset_env(base_url, task_id, email_id)
+                action = _heuristic_action(observation)
+                _step_env(base_url, action)
+                per_email_scores.append(_grade_env(base_url, task_id, action))
+            except Exception as exc:
+                print(
+                    f"Warning: heuristic baseline evaluation failed for {task_id}/{email_id}: {exc}",
+                    flush=True,
+                )
+                per_email_scores.append(0.0)
+        scores[task_id] = sum(per_email_scores) / max(1, len(per_email_scores))
 
     return scores
 
@@ -230,6 +244,7 @@ def _build_action_with_llm(client: Any, model_name: str, observation: Dict[str, 
             ],
             temperature=0.0,
             max_tokens=260,
+            timeout=LLM_TIMEOUT_SECONDS,
         )
         raw = completion.choices[0].message.content or ""
         parsed = _extract_json_object(raw)
@@ -493,24 +508,101 @@ def parse_args() -> argparse.Namespace:
         default="http://localhost:7860",
         help="Base URL of the deployed OpenEnv API",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast mode: cap each task to 3 emails and lower LLM timeout.",
+    )
+    parser.add_argument(
+        "--max-emails-per-task",
+        type=int,
+        default=None,
+        help="Override max emails evaluated per task (0 means all).",
+    )
+    parser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=None,
+        help="Override LLM request timeout in seconds.",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    api_base_url, model_name, hf_token = get_required_llm_env()
-
-    if OpenAI is None:
-        raise SystemExit("openai package is not installed. Run: pip install -r requirements.txt")
-
-    client = OpenAI(base_url=api_base_url, api_key=hf_token)
-    scores = run_inference(base_url=args.base_url, client=client, model_name=model_name)
-
+def _print_scores(scores: Dict[str, float]) -> None:
     print("Inference scores:")
     for task_id, score in scores.items():
         print(f"- {task_id}: {score:.3f}")
     print("\nJSON:")
     print(json.dumps(scores, indent=2, sort_keys=True))
+
+
+def _safe_baseline(base_url: str) -> Dict[str, float]:
+    try:
+        return run_baseline(base_url=base_url)
+    except Exception as exc:
+        print(f"Warning: run_baseline failed ({exc}). Trying heuristic fallback.", flush=True)
+
+    try:
+        return _run_heuristic_baseline(base_url=base_url)
+    except Exception as exc:
+        print(f"Warning: heuristic fallback failed ({exc}). Returning zero scores.", flush=True)
+        return {
+            "task-urgency": 0.0,
+            "task-routing": 0.0,
+            "task-full-triage": 0.0,
+        }
+
+
+def main() -> None:
+    global LLM_TIMEOUT_SECONDS, MAX_EMAILS_PER_TASK
+
+    args = parse_args()
+
+    if args.fast:
+        MAX_EMAILS_PER_TASK = 3
+        LLM_TIMEOUT_SECONDS = min(LLM_TIMEOUT_SECONDS, 12.0)
+
+    if args.max_emails_per_task is not None:
+        MAX_EMAILS_PER_TASK = max(0, int(args.max_emails_per_task))
+
+    if args.llm_timeout is not None:
+        LLM_TIMEOUT_SECONDS = max(1.0, float(args.llm_timeout))
+
+    print(
+        f"Runtime options: llm_timeout={LLM_TIMEOUT_SECONDS}s, max_emails_per_task={MAX_EMAILS_PER_TASK}",
+        flush=True,
+    )
+
+    api_base_url = os.getenv("API_BASE_URL")
+    model_name = os.getenv("MODEL_NAME") or DEFAULT_MODEL_NAME
+    hf_token = os.getenv("HF_TOKEN")
+
+    if not os.getenv("MODEL_NAME"):
+        print(f"Warning: MODEL_NAME not set. Using default: {DEFAULT_MODEL_NAME}", flush=True)
+
+    can_use_llm = bool(OpenAI is not None and api_base_url and hf_token)
+
+    if can_use_llm:
+        try:
+            client = OpenAI(base_url=api_base_url, api_key=hf_token)
+            scores = run_inference(base_url=args.base_url, client=client, model_name=model_name)
+            _print_scores(scores)
+            return
+        except Exception as exc:
+            print(f"Warning: LLM inference failed ({exc}). Falling back to baseline.", flush=True)
+
+    missing_reasons = []
+    if OpenAI is None:
+        missing_reasons.append("openai package unavailable")
+    if not api_base_url:
+        missing_reasons.append("API_BASE_URL missing")
+    if not hf_token:
+        missing_reasons.append("HF_TOKEN missing")
+    if missing_reasons:
+        print("Warning: " + ", ".join(missing_reasons) + ". Using baseline fallback.", flush=True)
+
+    scores = _safe_baseline(base_url=args.base_url)
+    _print_scores(scores)
 
 
 if __name__ == "__main__":
