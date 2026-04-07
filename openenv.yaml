@@ -1,0 +1,36 @@
+spec_version: 1
+name: email-triage-env
+version: 1.0.0
+description: Email triage and prioritization environment for classifying urgency, routing, and summarizing incoming emails.
+type: space
+runtime: fastapi
+app: app:app
+port: 7860
+action_space:
+  task_id: string
+  urgency: string
+  department: string
+  summary: string
+  queue_position: integer
+  escalate: boolean
+  notes: string
+observation_space:
+  email_id: string
+  sender: string
+  subject: string
+  body: string
+  task_id: string
+  task_name: string
+  available_urgency_labels: list[string]
+  available_departments: list[string]
+  compliance_risk: boolean
+  sender_tier: string
+  business_impact: integer
+  minutes_to_breach: integer
+  queue_position: integer
+  queue_size: integer
+  step_count: integer
+  max_steps: integer
+tags:
+  - openenv
+
