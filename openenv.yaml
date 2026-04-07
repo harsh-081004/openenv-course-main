@@ -31,6 +31,28 @@ observation_space:
   queue_size: integer
   step_count: integer
   max_steps: integer
+tasks:
+  - task_id: task-urgency
+    name: Urgency Classification
+    grader:
+      endpoint: /grader
+      method: POST
+      task_id: task-urgency
+      grader_name: grade_task1
+  - task_id: task-routing
+    name: Department Routing
+    grader:
+      endpoint: /grader
+      method: POST
+      task_id: task-routing
+      grader_name: grade_task2
+  - task_id: task-full-triage
+    name: Full Triage
+    grader:
+      endpoint: /grader
+      method: POST
+      task_id: task-full-triage
+      grader_name: grade_task3
 tags:
   - openenv
 

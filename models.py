@@ -109,6 +109,10 @@ class TaskInfo(BaseModel):
     difficulty: str
     objective: str
     description: str
+    grader_name: str = Field(..., description="Name of grader logic associated with this task")
+    has_grader: bool = Field(default=True, description="Whether this task has an enabled grader")
+    grader_endpoint: str = Field(default="/grader", description="HTTP endpoint used for grading")
+    grader: Dict[str, object] = Field(default_factory=dict, description="Structured grader metadata")
 
 
 class GraderRequest(BaseModel):
