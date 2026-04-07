@@ -1,9 +1,11 @@
-"""OpenAI-powered inference script for the OpenEnv email triage environment.
+"""Inference script for the Email Triage OpenEnv environment.
 
-Required environment variables:
-- API_BASE_URL: LLM API base URL
-- MODEL_NAME: model identifier
-- HF_TOKEN: Hugging Face token / API key
+Submission requirements covered:
+- Script name is inference.py at project root.
+- Uses OpenAI client for LLM action generation.
+- Reads API_BASE_URL, MODEL_NAME, HF_TOKEN from environment.
+- Emits strict stdout line types in order: [START], [STEP], [END].
+- Avoids unhandled exceptions by falling back to heuristic actions/scores.
 """
 
 from __future__ import annotations
@@ -12,8 +14,9 @@ import argparse
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -23,6 +26,11 @@ except Exception:
     OpenAI = None  # type: ignore
 
 
+DEFAULT_API_BASE_URL = "https://router.huggingface.co/v1"
+DEFAULT_MODEL_NAME = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
+
+TASK_IDS = ["task-urgency", "task-routing", "task-full-triage"]
 TASK_EMAIL_MAP = {
     "task-urgency": ["email-001", "email-003", "email-005"],
     "task-routing": ["email-001", "email-002", "email-004"],
@@ -36,58 +44,87 @@ SYSTEM_PROMPT = (
     "queue_position in {1,2,3}; escalate as boolean."
 )
 
-DEFAULT_MODEL_NAME = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"
+SUCCESS_SCORE_THRESHOLD = 0.10
+HTTP_TIMEOUT_SECONDS = 30
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
 MAX_EMAILS_PER_TASK = int(os.getenv("MAX_EMAILS_PER_TASK", "0"))
 
 
-def get_required_llm_env() -> Tuple[str, str, str]:
-    api_base_url = os.getenv("API_BASE_URL")
-    model_name = os.getenv("MODEL_NAME")
-    hf_token = os.getenv("HF_TOKEN")
-
-    missing = []
-    if not api_base_url:
-        missing.append("API_BASE_URL")
-    if not model_name:
-        missing.append("MODEL_NAME")
-    if not hf_token:
-        missing.append("HF_TOKEN")
-
-    if missing:
-        raise SystemExit(
-            "Missing required environment variables: "
-            + ", ".join(missing)
-            + "\nDefine API_BASE_URL, MODEL_NAME, and HF_TOKEN before running inference.py"
-        )
-
-    return api_base_url, model_name, hf_token
+def _single_line(text: str) -> str:
+    return " ".join(str(text).split())
 
 
-def run_inference(base_url: str, client: Any, model_name: str) -> Dict[str, float]:
-    scores: Dict[str, float] = {}
-    all_email_ids = _load_all_email_ids()
-
-    for task_id in ["task-urgency", "task-routing", "task-full-triage"]:
-        email_ids = all_email_ids or TASK_EMAIL_MAP[task_id]
-        if MAX_EMAILS_PER_TASK > 0:
-            email_ids = email_ids[:MAX_EMAILS_PER_TASK]
-        print(f"Evaluating {task_id} on {len(email_ids)} emails...", flush=True)
-        per_email_scores = [
-            _evaluate_task_on_email(
-                base_url=base_url,
-                task_id=task_id,
-                email_id=email_id,
-                client=client,
-                model_name=model_name,
-            )
-            for email_id in email_ids
-        ]
-        scores[task_id] = sum(per_email_scores) / len(per_email_scores)
-    return scores
+def _clamp01(value: float) -> float:
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
 
 
-def _load_all_email_ids() -> list[str]:
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={_single_line(task)} env={_single_line(env)} model={_single_line(model)}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    done_val = str(bool(done)).lower()
+    error_val = "null" if not error else _single_line(error)
+    action_val = _single_line(action)
+    print(
+        f"[STEP] step={step} action={action_val} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    success_val = str(bool(success)).lower()
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={success_val} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run OpenAI-based inference against OpenEnv API")
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default="http://localhost:7860",
+        help="Base URL of the deployed OpenEnv API",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast mode: evaluate fewer emails per task with lower LLM timeout.",
+    )
+    parser.add_argument(
+        "--max-emails-per-task",
+        type=int,
+        default=None,
+        help="Override max emails evaluated per task (0 means all).",
+    )
+    parser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=None,
+        help="Override LLM request timeout in seconds.",
+    )
+    return parser.parse_args()
+
+
+def _configure_runtime(args: argparse.Namespace) -> None:
+    global MAX_EMAILS_PER_TASK, LLM_TIMEOUT_SECONDS
+
+    if args.fast:
+        MAX_EMAILS_PER_TASK = 3
+        LLM_TIMEOUT_SECONDS = min(LLM_TIMEOUT_SECONDS, 12.0)
+
+    if args.max_emails_per_task is not None:
+        MAX_EMAILS_PER_TASK = max(0, int(args.max_emails_per_task))
+
+    if args.llm_timeout is not None:
+        LLM_TIMEOUT_SECONDS = max(1.0, float(args.llm_timeout))
+
+
+def _load_all_email_ids() -> List[str]:
     tasks_file = Path(__file__).resolve().parent / "tasks.py"
     if not tasks_file.exists():
         return []
@@ -102,7 +139,7 @@ def _load_all_email_ids() -> list[str]:
         return []
 
     emails = getattr(module, "EMAILS", [])
-    ids: list[str] = []
+    ids: List[str] = []
     for item in emails:
         email_id = getattr(item, "email_id", None)
         if isinstance(email_id, str) and email_id:
@@ -110,191 +147,66 @@ def _load_all_email_ids() -> list[str]:
     return ids
 
 
-def run_baseline(base_url: str = "http://localhost:7860") -> Dict[str, float]:
-    """Compatibility entrypoint used by the FastAPI /baseline endpoint.
+def _build_client_and_model() -> Tuple[Optional[Any], str]:
+    api_base_url = os.getenv("API_BASE_URL", DEFAULT_API_BASE_URL)
+    model_name = os.getenv("MODEL_NAME", DEFAULT_MODEL_NAME)
+    api_key = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
-    Behavior:
-    - If API_BASE_URL, MODEL_NAME, and HF_TOKEN are configured, use OpenAI-backed inference.
-    - Otherwise, fall back to the deterministic baseline implementation.
-    """
-
-    api_base_url = os.getenv("API_BASE_URL")
-    model_name = os.getenv("MODEL_NAME")
-    hf_token = os.getenv("HF_TOKEN")
-
-    if api_base_url and model_name and hf_token:
-        if OpenAI is None:
-            raise RuntimeError(
-                "openai package is not installed. Install dependencies from requirements.txt before running LLM baseline."
-            )
-        client = OpenAI(base_url=api_base_url, api_key=hf_token)
-        return run_inference(base_url=base_url, client=client, model_name=model_name)
-
-    # Keep /baseline functional in local and container runs even without LLM secrets.
-    deterministic_run_baseline = _load_deterministic_baseline_runner()
-    if deterministic_run_baseline is None:
-        return _run_heuristic_baseline(base_url=base_url)
-    return deterministic_run_baseline(base_url=base_url)
-
-
-def _run_heuristic_baseline(base_url: str) -> Dict[str, float]:
-    scores: Dict[str, float] = {}
-    all_email_ids = _load_all_email_ids()
-
-    for task_id in ["task-urgency", "task-routing", "task-full-triage"]:
-        email_ids = all_email_ids or TASK_EMAIL_MAP[task_id]
-        per_email_scores = []
-        for email_id in email_ids:
-            try:
-                observation = _reset_env(base_url, task_id, email_id)
-                action = _heuristic_action(observation)
-                _step_env(base_url, action)
-                per_email_scores.append(_grade_env(base_url, task_id, action))
-            except Exception as exc:
-                print(
-                    f"Warning: heuristic baseline evaluation failed for {task_id}/{email_id}: {exc}",
-                    flush=True,
-                )
-                per_email_scores.append(0.0)
-        scores[task_id] = sum(per_email_scores) / max(1, len(per_email_scores))
-
-    return scores
-
-
-def _load_deterministic_baseline_runner() -> Any | None:
-    baseline_file = Path(__file__).resolve().parent / "baseline" / "inference.py"
-    if not baseline_file.exists():
-        return None
+    if OpenAI is None or not api_key:
+        return None, model_name
 
     try:
-        spec = importlib.util.spec_from_file_location("baseline_inference_module", baseline_file)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        return OpenAI(base_url=api_base_url, api_key=api_key), model_name
     except Exception:
-        return None
-
-    fn = getattr(module, "run_baseline", None)
-    if callable(fn):
-        return fn
-    return None
+        return None, model_name
 
 
-def _evaluate_task_on_email(
-    base_url: str,
-    task_id: str,
-    email_id: str,
-    client: Any,
-    model_name: str,
-) -> float:
-    observation = _reset_env(base_url, task_id, email_id)
-    action = _build_action_with_llm(client, model_name, observation)
-    _step_env(base_url, action)
-    return _grade_env(base_url, task_id, action)
-
-
-def _reset_env(base_url: str, task_id: str, email_id: str | None = None) -> Dict[str, Any]:
+def _reset_env(session: requests.Session, base_url: str, task_id: str, email_id: Optional[str]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"task_id": task_id}
     if email_id:
         payload["email_id"] = email_id
-    response = requests.post(f"{base_url}/reset", json=payload, timeout=30)
+    response = session.post(f"{base_url}/reset", json=payload, timeout=HTTP_TIMEOUT_SECONDS)
     response.raise_for_status()
     return response.json()["observation"]
 
 
-def _step_env(base_url: str, action: Dict[str, Any]) -> None:
-    response = requests.post(f"{base_url}/step", json=action, timeout=30)
+def _step_env(session: requests.Session, base_url: str, action: Dict[str, Any]) -> Dict[str, Any]:
+    response = session.post(f"{base_url}/step", json=action, timeout=HTTP_TIMEOUT_SECONDS)
     response.raise_for_status()
+    return response.json()
 
 
-def _grade_env(base_url: str, task_id: str, action: Dict[str, Any]) -> float:
-    response = requests.post(
+def _grade_env(session: requests.Session, base_url: str, task_id: str, action: Dict[str, Any]) -> float:
+    response = session.post(
         f"{base_url}/grader",
         json={"task_id": task_id, "action": action},
-        timeout=30,
+        timeout=HTTP_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     payload = response.json()
-    return float(payload.get("score", 0.0))
+    return _clamp01(float(payload.get("score", 0.0)))
 
 
-def _build_action_with_llm(client: Any, model_name: str, observation: Dict[str, Any]) -> Dict[str, Any]:
-    heuristic_action = _heuristic_action(observation)
-
-    user_prompt = (
-        "Create a triage action for this email observation.\n"
-        "Return strict JSON only with these keys:\n"
-        "task_id, urgency, department, summary, queue_position, escalate, notes\n\n"
-        "Rules:\n"
-        "- urgency must be one of available_urgency_labels\n"
-        "- department must be one of available_departments\n"
-        "- queue_position must be 1, 2, or 3\n"
-        "- escalate must be boolean\n"
-        "- summary must be one sentence\n\n"
-        f"Observation:\n{json.dumps(observation, ensure_ascii=True)}"
-    )
-
-    try:
-        completion = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            max_tokens=260,
-            timeout=LLM_TIMEOUT_SECONDS,
-        )
-        raw = completion.choices[0].message.content or ""
-        parsed = _extract_json_object(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("Model output was not a JSON object")
-        llm_action = _normalize_action(parsed, observation)
-        return _merge_llm_with_heuristics(llm_action, heuristic_action)
-    except Exception:
-        # Keep inference resilient to transient LLM formatting failures.
-        return heuristic_action
+def _extract_step_error(step_payload: Dict[str, Any]) -> Optional[str]:
+    info = step_payload.get("info")
+    if isinstance(info, dict):
+        last_error = info.get("last_action_error")
+        if last_error:
+            return str(last_error)
+    return None
 
 
-def _merge_llm_with_heuristics(llm_action: Dict[str, Any], heuristic_action: Dict[str, Any]) -> Dict[str, Any]:
-    # Prefer LLM outputs when valid so actions do not collapse to one repeated pattern.
-    urgency = str(llm_action.get("urgency", "")).strip().lower() or str(heuristic_action["urgency"])
-    if urgency not in {"urgent", "normal", "low"}:
-        urgency = str(heuristic_action["urgency"])
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        return json.loads(cleaned)
 
-    department = str(llm_action.get("department", "")).strip().lower() or str(heuristic_action["department"])
-    if department not in {"billing", "technical", "sales", "hr", "general"}:
-        department = str(heuristic_action["department"])
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return json.loads(cleaned[start : end + 1])
 
-    summary = str(llm_action.get("summary", "")).strip()
-    if not _is_useful_summary(summary):
-        summary = str(heuristic_action.get("summary", "")).strip()
-
-    queue_position = llm_action.get("queue_position", heuristic_action["queue_position"])
-    if not isinstance(queue_position, int) or queue_position not in {1, 2, 3}:
-        queue_position = int(heuristic_action["queue_position"])
-
-    escalate = llm_action.get("escalate", heuristic_action["escalate"])
-    if not isinstance(escalate, bool):
-        escalate = bool(heuristic_action["escalate"])
-
-    # Hard safety guardrails only for known high-risk conditions.
-    compliance_risk = bool(heuristic_action.get("department") == "hr" and heuristic_action.get("escalate"))
-    if compliance_risk:
-        department = "hr"
-        queue_position = 1
-        escalate = True
-
-    return {
-        "task_id": heuristic_action["task_id"],
-        "urgency": urgency,
-        "department": department,
-        "summary": summary,
-        "queue_position": queue_position,
-        "escalate": escalate,
-        "notes": str(llm_action.get("notes", "hybrid llm+heuristic")).strip() or "hybrid llm+heuristic",
-    }
+    raise ValueError("No JSON object found")
 
 
 def _is_useful_summary(summary: str) -> bool:
@@ -305,21 +217,7 @@ def _is_useful_summary(summary: str) -> bool:
         return False
     lower = summary.lower()
     banned = ["i can't", "cannot", "unable", "insufficient", "n/a"]
-    if any(token in lower for token in banned):
-        return False
-    return True
-
-
-def _extract_json_object(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    if text.startswith("{") and text.endswith("}"):
-        return json.loads(text)
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(text[start : end + 1])
-    raise ValueError("No JSON object found")
+    return not any(token in lower for token in banned)
 
 
 def _normalize_action(candidate: Dict[str, Any], observation: Dict[str, Any]) -> Dict[str, Any]:
@@ -364,86 +262,48 @@ def _normalize_action(candidate: Dict[str, Any], observation: Dict[str, Any]) ->
     }
 
 
-def _fallback_action(observation: Dict[str, Any]) -> Dict[str, Any]:
-    return _heuristic_action(observation)
+def _merge_llm_with_heuristics(llm_action: Dict[str, Any], heuristic_action: Dict[str, Any]) -> Dict[str, Any]:
+    urgency = str(llm_action.get("urgency", "")).strip().lower() or str(heuristic_action["urgency"])
+    if urgency not in {"urgent", "normal", "low"}:
+        urgency = str(heuristic_action["urgency"])
 
+    department = str(llm_action.get("department", "")).strip().lower() or str(heuristic_action["department"])
+    if department not in {"billing", "technical", "sales", "hr", "general"}:
+        department = str(heuristic_action["department"])
 
-def _heuristic_action(observation: Dict[str, Any]) -> Dict[str, Any]:
-    text = f"{observation.get('subject', '')} {observation.get('body', '')}".lower()
-    compliance_risk = bool(observation.get("compliance_risk", False))
-    minutes_to_breach = int(observation.get("minutes_to_breach", 9999))
-    business_impact = int(observation.get("business_impact", 0))
-    sender_tier = str(observation.get("sender_tier", "standard")).lower()
+    summary = str(llm_action.get("summary", "")).strip()
+    if not _is_useful_summary(summary):
+        summary = str(heuristic_action.get("summary", "")).strip()
 
-    urgent_hits = ["failed", "error", "outage", "500", "blocked", "ssn", "pci", "exposure", "incident"]
-    low_hits = ["dark mode", "feature request", "eta"]
+    queue_position = llm_action.get("queue_position", heuristic_action["queue_position"])
+    if not isinstance(queue_position, int) or queue_position not in {1, 2, 3}:
+        queue_position = int(heuristic_action["queue_position"])
 
-    urgency = "normal"
-    if compliance_risk or minutes_to_breach <= 45 or any(token in text for token in urgent_hits):
-        urgency = "urgent"
-    elif any(token in text for token in low_hits):
-        urgency = "low"
+    escalate = llm_action.get("escalate", heuristic_action["escalate"])
+    if not isinstance(escalate, bool):
+        escalate = bool(heuristic_action["escalate"])
 
-    department = _predict_department(text=text, compliance_risk=compliance_risk)
-
-    queue_position = 1 if urgency == "urgent" else (2 if urgency == "normal" else 3)
+    compliance_risk = bool(heuristic_action.get("department") == "hr" and heuristic_action.get("escalate"))
     if compliance_risk:
+        department = "hr"
         queue_position = 1
-
-    escalate = False
-    if compliance_risk or minutes_to_breach <= 45:
         escalate = True
-    elif sender_tier in {"enterprise", "strategic"} and business_impact >= 85:
-        escalate = True
-    elif urgency == "urgent" and minutes_to_breach <= 60:
-        escalate = True
-
-    summary = _heuristic_summary(observation, urgency, department, escalate)
 
     return {
-        "task_id": observation["task_id"],
+        "task_id": heuristic_action["task_id"],
         "urgency": urgency,
         "department": department,
         "summary": summary,
         "queue_position": queue_position,
         "escalate": escalate,
-        "notes": "heuristic guardrail",
+        "notes": str(llm_action.get("notes", "hybrid llm+heuristic")).strip() or "hybrid llm+heuristic",
     }
-
-
-def _heuristic_summary(observation: Dict[str, Any], urgency: str, department: str, escalate: bool) -> str:
-    text = f"{observation.get('subject', '')} {observation.get('body', '')}".lower()
-
-    if department == "technical":
-        if "500" in text or "api" in text:
-            return "Report ongoing 500 errors on API endpoints and request outage guidance."
-        return "Report a technical service disruption and request urgent engineering support."
-
-    if department == "billing":
-        if "credit memo" in text or "ledger" in text:
-            return "Flag credit memo mismatch and request urgent billing correction before close."
-        return "Investigate payment or invoice failures and confirm account billing status."
-
-    if department == "sales":
-        return "Ask for enterprise pricing quote and onboarding timeline details."
-
-    if department == "hr":
-        if any(token in text for token in ["pci", "ssn", "compliance", "legal"]):
-            return "Report sensitive data exposure and request immediate compliance handling guidance."
-        return "Route to HR for documentation handling and policy-compliant follow-up."
-
-    if urgency == "low":
-        return "Ask about feature availability and ETA, with low-priority follow-up."
-
-    escalation_text = "with escalation due to SLA risk" if escalate else "with standard follow-up"
-    return f"Summarize customer request and route to {department} {escalation_text}."
 
 
 def _predict_department(text: str, compliance_risk: bool) -> str:
     if compliance_risk:
         return "hr"
 
-    # Weighted keyword votes reduce ambiguous routing errors.
     scores = {
         "billing": 0,
         "technical": 0,
@@ -500,109 +360,228 @@ def _predict_department(text: str, compliance_risk: bool) -> str:
     return best_department
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run OpenAI-based inference against OpenEnv API")
-    parser.add_argument(
-        "--base-url",
-        type=str,
-        default="http://localhost:7860",
-        help="Base URL of the deployed OpenEnv API",
-    )
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help="Fast mode: cap each task to 3 emails and lower LLM timeout.",
-    )
-    parser.add_argument(
-        "--max-emails-per-task",
-        type=int,
-        default=None,
-        help="Override max emails evaluated per task (0 means all).",
-    )
-    parser.add_argument(
-        "--llm-timeout",
-        type=float,
-        default=None,
-        help="Override LLM request timeout in seconds.",
-    )
-    return parser.parse_args()
+def _heuristic_summary(observation: Dict[str, Any], urgency: str, department: str, escalate: bool) -> str:
+    text = f"{observation.get('subject', '')} {observation.get('body', '')}".lower()
+
+    if department == "technical":
+        if "500" in text or "api" in text:
+            return "Report ongoing 500 errors on API endpoints and request outage guidance."
+        return "Report a technical service disruption and request urgent engineering support."
+
+    if department == "billing":
+        if "credit memo" in text or "ledger" in text:
+            return "Flag credit memo mismatch and request urgent billing correction before close."
+        return "Investigate payment or invoice failures and confirm account billing status."
+
+    if department == "sales":
+        return "Ask for enterprise pricing quote and onboarding timeline details."
+
+    if department == "hr":
+        if any(token in text for token in ["pci", "ssn", "compliance", "legal"]):
+            return "Report sensitive data exposure and request immediate compliance handling guidance."
+        return "Route to HR for documentation handling and policy-compliant follow-up."
+
+    if urgency == "low":
+        return "Ask about feature availability and ETA, with low-priority follow-up."
+
+    escalation_text = "with escalation due to SLA risk" if escalate else "with standard follow-up"
+    return f"Summarize customer request and route to {department} {escalation_text}."
 
 
-def _print_scores(scores: Dict[str, float]) -> None:
-    print("Inference scores:")
-    for task_id, score in scores.items():
-        print(f"- {task_id}: {score:.3f}")
-    print("\nJSON:")
-    print(json.dumps(scores, indent=2, sort_keys=True))
+def _heuristic_action(observation: Dict[str, Any]) -> Dict[str, Any]:
+    text = f"{observation.get('subject', '')} {observation.get('body', '')}".lower()
+    compliance_risk = bool(observation.get("compliance_risk", False))
+    minutes_to_breach = int(observation.get("minutes_to_breach", 9999))
+    business_impact = int(observation.get("business_impact", 0))
+    sender_tier = str(observation.get("sender_tier", "standard")).lower()
+
+    urgent_hits = ["failed", "error", "outage", "500", "blocked", "ssn", "pci", "exposure", "incident"]
+    low_hits = ["dark mode", "feature request", "eta"]
+
+    urgency = "normal"
+    if compliance_risk or minutes_to_breach <= 45 or any(token in text for token in urgent_hits):
+        urgency = "urgent"
+    elif any(token in text for token in low_hits):
+        urgency = "low"
+
+    department = _predict_department(text=text, compliance_risk=compliance_risk)
+    queue_position = 1 if urgency == "urgent" else (2 if urgency == "normal" else 3)
+    if compliance_risk:
+        queue_position = 1
+
+    escalate = False
+    if compliance_risk or minutes_to_breach <= 45:
+        escalate = True
+    elif sender_tier in {"enterprise", "strategic"} and business_impact >= 85:
+        escalate = True
+    elif urgency == "urgent" and minutes_to_breach <= 60:
+        escalate = True
+
+    summary = _heuristic_summary(observation, urgency, department, escalate)
+
+    return {
+        "task_id": observation["task_id"],
+        "urgency": urgency,
+        "department": department,
+        "summary": summary,
+        "queue_position": queue_position,
+        "escalate": escalate,
+        "notes": "heuristic guardrail",
+    }
 
 
-def _safe_baseline(base_url: str) -> Dict[str, float]:
+def _build_action_with_llm(client: Optional[Any], model_name: str, observation: Dict[str, Any]) -> Dict[str, Any]:
+    heuristic_action = _heuristic_action(observation)
+    if client is None:
+        return heuristic_action
+
+    user_prompt = (
+        "Create a triage action for this email observation.\n"
+        "Return strict JSON only with these keys:\n"
+        "task_id, urgency, department, summary, queue_position, escalate, notes\n\n"
+        "Rules:\n"
+        "- urgency must be one of available_urgency_labels\n"
+        "- department must be one of available_departments\n"
+        "- queue_position must be 1, 2, or 3\n"
+        "- escalate must be boolean\n"
+        "- summary must be one sentence\n\n"
+        f"Observation:\n{json.dumps(observation, ensure_ascii=True)}"
+    )
+
     try:
-        return run_baseline(base_url=base_url)
-    except Exception as exc:
-        print(f"Warning: run_baseline failed ({exc}). Trying heuristic fallback.", flush=True)
+        completion = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            max_tokens=260,
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+        raw = completion.choices[0].message.content or ""
+        parsed = _extract_json_object(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("Model output was not a JSON object")
+        llm_action = _normalize_action(parsed, observation)
+        return _merge_llm_with_heuristics(llm_action, heuristic_action)
+    except Exception:
+        return heuristic_action
 
+
+def _evaluate(
+    session: requests.Session,
+    base_url: str,
+    client: Optional[Any],
+    model_name: str,
+    emit_logs: bool,
+) -> Tuple[Dict[str, float], List[float], int]:
+    task_scores: Dict[str, float] = {}
+    rewards: List[float] = []
+    step_count = 0
+
+    all_email_ids = _load_all_email_ids()
+
+    for task_id in TASK_IDS:
+        email_ids = all_email_ids or TASK_EMAIL_MAP[task_id]
+        if MAX_EMAILS_PER_TASK > 0:
+            email_ids = email_ids[:MAX_EMAILS_PER_TASK]
+
+        per_task_scores: List[float] = []
+
+        for email_id in email_ids:
+            action_str = "noop()"
+            reward = 0.0
+            done = False
+            error: Optional[str] = None
+            score = 0.0
+
+            try:
+                observation = _reset_env(session, base_url, task_id, email_id)
+                action = _build_action_with_llm(client, model_name, observation)
+                action_str = json.dumps(action, separators=(",", ":"), ensure_ascii=True)
+                step_payload = _step_env(session, base_url, action)
+                reward = float(step_payload.get("reward", 0.0))
+                done = bool(step_payload.get("done", False))
+                error = _extract_step_error(step_payload)
+                score = _grade_env(session, base_url, task_id, action)
+            except Exception as exc:
+                error = str(exc)
+                reward = 0.0
+                done = True
+                score = 0.0
+
+            step_count += 1
+            rewards.append(reward)
+            per_task_scores.append(_clamp01(score))
+
+            if emit_logs:
+                log_step(step_count, action_str, reward, done, error)
+
+        task_scores[task_id] = sum(per_task_scores) / max(1, len(per_task_scores))
+
+    return task_scores, rewards, step_count
+
+
+def run_baseline(base_url: str = "http://localhost:7860", emit_logs: bool = False) -> Dict[str, float]:
+    """Entry point consumed by both the API baseline endpoint and local script runs."""
+
+    client, model_name = _build_client_and_model()
+    session = requests.Session()
     try:
-        return _run_heuristic_baseline(base_url=base_url)
-    except Exception as exc:
-        print(f"Warning: heuristic fallback failed ({exc}). Returning zero scores.", flush=True)
+        scores, _, _ = _evaluate(
+            session=session,
+            base_url=base_url,
+            client=client,
+            model_name=model_name,
+            emit_logs=emit_logs,
+        )
+        return scores
+    except Exception:
         return {
             "task-urgency": 0.0,
             "task-routing": 0.0,
             "task-full-triage": 0.0,
         }
+    finally:
+        session.close()
 
 
 def main() -> None:
-    global LLM_TIMEOUT_SECONDS, MAX_EMAILS_PER_TASK
-
     args = parse_args()
+    _configure_runtime(args)
 
-    if args.fast:
-        MAX_EMAILS_PER_TASK = 3
-        LLM_TIMEOUT_SECONDS = min(LLM_TIMEOUT_SECONDS, 12.0)
+    client, model_name = _build_client_and_model()
+    benchmark_name = os.getenv("OPENENV_BENCHMARK", "email-triage-openenv")
+    task_name = os.getenv("OPENENV_TASK_NAME", "multi-task-eval")
 
-    if args.max_emails_per_task is not None:
-        MAX_EMAILS_PER_TASK = max(0, int(args.max_emails_per_task))
+    step_count = 0
+    rewards: List[float] = []
+    overall_score = 0.0
+    success = False
 
-    if args.llm_timeout is not None:
-        LLM_TIMEOUT_SECONDS = max(1.0, float(args.llm_timeout))
+    log_start(task=task_name, env=benchmark_name, model=model_name)
 
-    print(
-        f"Runtime options: llm_timeout={LLM_TIMEOUT_SECONDS}s, max_emails_per_task={MAX_EMAILS_PER_TASK}",
-        flush=True,
-    )
-
-    api_base_url = os.getenv("API_BASE_URL")
-    model_name = os.getenv("MODEL_NAME") or DEFAULT_MODEL_NAME
-    hf_token = os.getenv("HF_TOKEN")
-
-    if not os.getenv("MODEL_NAME"):
-        print(f"Warning: MODEL_NAME not set. Using default: {DEFAULT_MODEL_NAME}", flush=True)
-
-    can_use_llm = bool(OpenAI is not None and api_base_url and hf_token)
-
-    if can_use_llm:
-        try:
-            client = OpenAI(base_url=api_base_url, api_key=hf_token)
-            scores = run_inference(base_url=args.base_url, client=client, model_name=model_name)
-            _print_scores(scores)
-            return
-        except Exception as exc:
-            print(f"Warning: LLM inference failed ({exc}). Falling back to baseline.", flush=True)
-
-    missing_reasons = []
-    if OpenAI is None:
-        missing_reasons.append("openai package unavailable")
-    if not api_base_url:
-        missing_reasons.append("API_BASE_URL missing")
-    if not hf_token:
-        missing_reasons.append("HF_TOKEN missing")
-    if missing_reasons:
-        print("Warning: " + ", ".join(missing_reasons) + ". Using baseline fallback.", flush=True)
-
-    scores = _safe_baseline(base_url=args.base_url)
-    _print_scores(scores)
+    session = requests.Session()
+    try:
+        task_scores, rewards, step_count = _evaluate(
+            session=session,
+            base_url=args.base_url,
+            client=client,
+            model_name=model_name,
+            emit_logs=True,
+        )
+        if task_scores:
+            overall_score = _clamp01(sum(task_scores.values()) / len(task_scores))
+        success = overall_score >= SUCCESS_SCORE_THRESHOLD
+    except Exception as exc:
+        # Keep this on stderr so stdout stays in strict START/STEP/END format.
+        print(f"Warning: inference execution failed: {exc}", file=sys.stderr, flush=True)
+        overall_score = 0.0
+        success = False
+    finally:
+        session.close()
+        log_end(success=success, steps=step_count, score=overall_score, rewards=rewards)
 
 
 if __name__ == "__main__":
