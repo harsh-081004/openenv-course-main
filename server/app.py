@@ -312,6 +312,59 @@ def grader(request: GraderRequest | None = None) -> GraderResponse:
     return GraderResponse(task_id=requested_task_id, score=score, details=details)
 
 
+@app.get("/graders")
+def graders_list() -> Dict[str, object]:
+    """List all available graders - alternative endpoint name."""
+    graders = _registered_graders()
+    return {
+        "grader_count": len(graders),
+        "task_ids": [grader["task_id"] for grader in graders],
+        "graders": graders,
+    }
+
+
+@app.post("/grader/{task_id}", response_model=GraderResponse)
+def grader_by_task(task_id: str, request: GraderRequest | None = None) -> GraderResponse:
+    """Task-specific grader endpoint."""
+    payload = request or GraderRequest()
+    action_payload = payload.action or {}
+
+    if task_id not in {task.task_id for task in TASKS}:
+        task_id = env.state().task_id
+
+    action_model = None
+    if action_payload:
+        action_model = EmailAction(
+            task_id=task_id,
+            urgency=action_payload.get("urgency"),
+            department=action_payload.get("department"),
+            summary=action_payload.get("summary"),
+            queue_position=action_payload.get("queue_position"),
+            escalate=action_payload.get("escalate"),
+            notes=action_payload.get("notes"),
+        )
+
+    score, details = env.grade(action=action_model, task_id=task_id)
+    return GraderResponse(task_id=task_id, score=score, details=details)
+
+
+@app.get("/grader/{task_id}")
+def grader_info_by_task(task_id: str) -> Dict[str, object]:
+    """Get grader info for a specific task."""
+    spec = TASK_GRADER_SPECS.get(task_id, {})
+    if not spec:
+        return {"error": f"Unknown task_id: {task_id}"}
+    return {
+        "task_id": task_id,
+        "grader": {
+            "task_id": task_id,
+            **spec,
+        },
+        "has_grader": True,
+        "enabled": True,
+    }
+
+
 @app.post("/baseline")
 def baseline() -> Dict[str, object]:
     results = run_baseline(base_url="http://localhost:7860")
