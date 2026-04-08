@@ -31,6 +31,11 @@ DEFAULT_MODEL_NAME = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
 
 TASK_IDS = ["task-urgency", "task-routing", "task-full-triage"]
+TASK_DIFFICULTY = {
+    "task-urgency": "easy",
+    "task-routing": "medium",
+    "task-full-triage": "hard",
+}
 TASK_EMAIL_MAP = {
     "task-urgency": ["email-001", "email-003", "email-005"],
     "task-routing": ["email-001", "email-002", "email-004"],
@@ -62,8 +67,9 @@ def _clamp01(value: float) -> float:
     return value
 
 
-def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={_single_line(task)} env={_single_line(env)} model={_single_line(model)}", flush=True)
+def log_start(task: str, env: str, model: str, difficulty: str = "") -> None:
+    diff_part = f" difficulty={_single_line(difficulty)}" if difficulty else ""
+    print(f"[START] task={_single_line(task)} env={_single_line(env)} model={_single_line(model)}{diff_part}", flush=True)
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
@@ -76,10 +82,15 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(task: str, success: bool, steps: int, score: float, rewards: List[float]) -> None:
     success_val = str(bool(success)).lower()
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={success_val} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+    # Ensure score is never exactly 0.0 or 1.0
+    if score <= 0.0:
+        score = 0.001
+    elif score >= 1.0:
+        score = 0.999
+    print(f"[END] task={_single_line(task)} success={success_val} steps={steps} score={score:.4f} rewards={rewards_str}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -553,35 +564,63 @@ def main() -> None:
 
     client, model_name = _build_client_and_model()
     benchmark_name = os.getenv("OPENENV_BENCHMARK", "email-triage-openenv")
-    task_name = os.getenv("OPENENV_TASK_NAME", "multi-task-eval")
-
-    step_count = 0
-    rewards: List[float] = []
-    overall_score = 0.0
-    success = False
-
-    log_start(task=task_name, env=benchmark_name, model=model_name)
 
     session = requests.Session()
     try:
-        task_scores, rewards, step_count = _evaluate(
-            session=session,
-            base_url=args.base_url,
-            client=client,
-            model_name=model_name,
-            emit_logs=True,
-        )
-        if task_scores:
-            overall_score = _clamp01(sum(task_scores.values()) / len(task_scores))
-        success = overall_score >= SUCCESS_SCORE_THRESHOLD
+        # Evaluate each task separately and emit [START]/[END] per task
+        for task_id in TASK_IDS:
+            difficulty = TASK_DIFFICULTY.get(task_id, "medium")
+            log_start(task=task_id, env=benchmark_name, model=model_name, difficulty=difficulty)
+
+            task_rewards: List[float] = []
+            task_step_count = 0
+            task_score = 0.0
+
+            all_email_ids = _load_all_email_ids()
+            email_ids = all_email_ids or TASK_EMAIL_MAP.get(task_id, [])
+            if MAX_EMAILS_PER_TASK > 0:
+                email_ids = email_ids[:MAX_EMAILS_PER_TASK]
+
+            per_email_scores: List[float] = []
+
+            for email_id in email_ids:
+                action_str = "noop()"
+                reward = 0.0
+                done = False
+                error: Optional[str] = None
+                score = 0.0
+
+                try:
+                    observation = _reset_env(session, args.base_url, task_id, email_id)
+                    action = _build_action_with_llm(client, model_name, observation)
+                    action_str = json.dumps(action, separators=(",", ":"), ensure_ascii=True)
+                    step_payload = _step_env(session, args.base_url, action)
+                    reward = float(step_payload.get("reward", 0.0))
+                    done = bool(step_payload.get("done", False))
+                    error = _extract_step_error(step_payload)
+                    score = _grade_env(session, args.base_url, task_id, action)
+                except Exception as exc:
+                    error = str(exc)
+                    reward = 0.0
+                    done = True
+                    score = 0.0
+
+                task_step_count += 1
+                task_rewards.append(reward)
+                per_email_scores.append(_clamp01(score))
+
+                log_step(task_step_count, action_str, reward, done, error)
+
+            if per_email_scores:
+                task_score = sum(per_email_scores) / len(per_email_scores)
+            
+            task_success = task_score >= SUCCESS_SCORE_THRESHOLD
+            log_end(task=task_id, success=task_success, steps=task_step_count, score=task_score, rewards=task_rewards)
+
     except Exception as exc:
-        # Keep this on stderr so stdout stays in strict START/STEP/END format.
         print(f"Warning: inference execution failed: {exc}", file=sys.stderr, flush=True)
-        overall_score = 0.0
-        success = False
     finally:
         session.close()
-        log_end(success=success, steps=step_count, score=overall_score, rewards=rewards)
 
 
 if __name__ == "__main__":

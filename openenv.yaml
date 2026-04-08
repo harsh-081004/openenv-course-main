@@ -34,6 +34,8 @@ observation_space:
 tasks:
   - task_id: task-urgency
     name: Urgency Classification
+    difficulty: easy
+    max_steps: 10
     has_grader: true
     grader:
       enabled: true
@@ -45,6 +47,8 @@ tasks:
       name: grade_task1
   - task_id: task-routing
     name: Department Routing
+    difficulty: medium
+    max_steps: 15
     has_grader: true
     grader:
       enabled: true
@@ -56,6 +60,8 @@ tasks:
       name: grade_task2
   - task_id: task-full-triage
     name: Full Triage
+    difficulty: hard
+    max_steps: 20
     has_grader: true
     grader:
       enabled: true
