@@ -190,8 +190,10 @@ class EmailTriageEnvironment:
                 penalties.append("queue_mismatch")
 
         # Keep rewards bounded to [0, 1] for stable evaluation.
+        # Ensure minimum reward of 0.001 to satisfy validation requirements.
+        MIN_REWARD = 0.001
         raw_total = min(1.0, score + sum(components.values()) * 0.1)
-        total = max(0.0, raw_total - penalty)
+        total = max(MIN_REWARD, raw_total - penalty)
 
         return Reward(total=total, components=components, penalties=penalties)
 
