@@ -312,6 +312,18 @@ def grader(request: GraderRequest | None = None) -> GraderResponse:
     return GraderResponse(task_id=requested_task_id, score=score, details=details)
 
 
+@app.post("/grade", response_model=GraderResponse)
+def grade_alias(request: GraderRequest | None = None) -> GraderResponse:
+    """Alias for /grader endpoint."""
+    return grader(request)
+
+
+@app.get("/grade")
+def grade_registry() -> Dict[str, object]:
+    """Alias for /grader GET endpoint."""
+    return grader_registry()
+
+
 @app.get("/graders")
 def graders_list() -> Dict[str, object]:
     """List all available graders - alternative endpoint name."""
