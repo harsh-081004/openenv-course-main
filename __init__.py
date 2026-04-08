@@ -6,7 +6,7 @@
 
 """Email Triage Environment."""
 
-from .client import EmailTriageClient
+from .client import EmailTriageClient, EmailTriageEnv, StepResult
 from .models import EmailAction, EmailObservation, Reward
 
 __all__ = [
@@ -14,4 +14,6 @@ __all__ = [
     "EmailObservation",
     "Reward",
     "EmailTriageClient",
+    "EmailTriageEnv",
+    "StepResult",
 ]
