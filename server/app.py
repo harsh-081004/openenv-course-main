@@ -8,15 +8,18 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 try:
     from inference import run_baseline
     from ..environment import EmailTriageEnvironment
     from ..models import (
         EmailAction,
+        EmailObservation,
+        EnvState,
         GraderRequest,
         GraderResponse,
         ResetRequest,
@@ -27,7 +30,16 @@ try:
 except ImportError:
     from inference import run_baseline
     from environment import EmailTriageEnvironment
-    from models import EmailAction, GraderRequest, GraderResponse, ResetRequest, StepResponse, TaskInfo
+    from models import (
+        EmailAction,
+        EmailObservation,
+        EnvState,
+        GraderRequest,
+        GraderResponse,
+        ResetRequest,
+        StepResponse,
+        TaskInfo,
+    )
     from tasks import TASKS
 
 
@@ -75,6 +87,127 @@ def _registered_graders() -> List[Dict[str, object]]:
 @app.get("/")
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    """Health check endpoint required by OpenEnv standard."""
+    return {"status": "healthy"}
+
+
+@app.get("/metadata")
+def metadata() -> Dict[str, Any]:
+    """Metadata endpoint required by OpenEnv standard."""
+    return {
+        "name": "email-triage-env",
+        "description": "Email triage and prioritization environment for classifying urgency, routing, and summarizing incoming emails.",
+        "version": "1.0.0",
+        "type": "space",
+        "runtime": "fastapi",
+        "port": 7860,
+        "tags": ["openenv"],
+    }
+
+
+@app.get("/schema")
+def schema() -> Dict[str, Any]:
+    """Schema endpoint required by OpenEnv standard."""
+    return {
+        "action": EmailAction.model_json_schema(),
+        "observation": EmailObservation.model_json_schema(),
+        "state": EnvState.model_json_schema(),
+    }
+
+
+@app.post("/mcp")
+def mcp(request: Dict[str, Any] | None = None) -> JSONResponse:
+    """MCP (Model Context Protocol) endpoint required by OpenEnv standard."""
+    payload = request or {}
+    request_id = payload.get("id", 1)
+    method = payload.get("method", "")
+
+    if method == "initialize":
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                },
+                "serverInfo": {
+                    "name": "email-triage-env",
+                    "version": "1.0.0",
+                },
+            },
+        })
+    elif method == "tools/list":
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "reset",
+                        "description": "Reset the environment to initial state",
+                        "inputSchema": ResetRequest.model_json_schema(),
+                    },
+                    {
+                        "name": "step",
+                        "description": "Take an action in the environment",
+                        "inputSchema": EmailAction.model_json_schema(),
+                    },
+                    {
+                        "name": "grade",
+                        "description": "Grade an action for a specific task",
+                        "inputSchema": GraderRequest.model_json_schema(),
+                    },
+                ],
+            },
+        })
+    elif method == "tools/call":
+        tool_name = payload.get("params", {}).get("name", "")
+        tool_args = payload.get("params", {}).get("arguments", {})
+
+        if tool_name == "reset":
+            obs = env.reset(task_id=tool_args.get("task_id"), email_id=tool_args.get("email_id"))
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"content": [{"type": "text", "text": obs.model_dump_json()}]},
+            })
+        elif tool_name == "step":
+            action = EmailAction(**tool_args)
+            obs, reward_detail, done, info = env.step(action)
+            result = {"observation": obs.model_dump(), "reward": reward_detail.total, "done": done, "info": info}
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"content": [{"type": "text", "text": str(result)}]},
+            })
+        elif tool_name == "grade":
+            action_payload = tool_args.get("action", {})
+            task_id = tool_args.get("task_id") or action_payload.get("task_id") or env.state().task_id
+            action = EmailAction(**action_payload) if action_payload else None
+            score, details = env.grade(action=action, task_id=task_id)
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"content": [{"type": "text", "text": f"score={score}, details={details}"}]},
+            })
+
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
+        })
+
+    # Default response for unknown methods
+    return JSONResponse(content={
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {},
+    })
 
 
 @app.post("/reset", response_model=StepResponse)
