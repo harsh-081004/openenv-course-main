@@ -11,6 +11,9 @@ except ImportError:
     from tasks import EmailItem
 
 
+# Minimum score to return (never exactly zero)
+MIN_SCORE = 0.001
+
 DEPARTMENT_ALIASES = {
     "billing": {"billing", "payments", "invoice", "finance"},
     "technical": {"technical", "engineering", "api", "bug"},
@@ -37,43 +40,43 @@ def normalize_label(value: str | None) -> str:
 def urgency_score(predicted: str | None, email: EmailItem) -> float:
     if normalize_label(predicted) == email.urgency:
         return 1.0
-    return 0.0
+    return MIN_SCORE
 
 
 def department_score(predicted: str | None, email: EmailItem) -> float:
     normalized = normalize_label(predicted)
     if not normalized:
-        return 0.0
+        return MIN_SCORE
     if _has_compliance_risk(email) and normalized not in {"hr", "billing"}:
-        return 0.0
+        return MIN_SCORE
     if normalized == email.department:
         return 1.0
     if normalized in RELATED_DEPARTMENTS.get(email.department, set()):
         return 0.5
     if normalized in DEPARTMENT_ALIASES.get(email.department, set()):
         return 0.5
-    return 0.0
+    return MIN_SCORE
 
 
 def summary_score(summary: str | None, email: EmailItem) -> float:
     if not summary:
-        return 0.0
+        return MIN_SCORE
     summary_tokens = set(_tokenize(summary))
     reference_tokens = set(_tokenize(email.reference_summary))
     if not summary_tokens or not reference_tokens:
-        return 0.0
+        return MIN_SCORE
     overlap = len(summary_tokens & reference_tokens) / max(1, len(reference_tokens))
-    return min(1.0, overlap * 1.5)
+    return max(MIN_SCORE, min(1.0, overlap * 1.5))
 
 
 def grade_task1(predicted_urgency: str | None, email: EmailItem) -> Tuple[float, Dict[str, float]]:
     score = urgency_score(predicted_urgency, email)
-    return score, {"urgency": score}
+    return max(MIN_SCORE, score), {"urgency": score}
 
 
 def grade_task2(predicted_department: str | None, email: EmailItem) -> Tuple[float, Dict[str, float]]:
     score = department_score(predicted_department, email)
-    return score, {"department": score}
+    return max(MIN_SCORE, score), {"department": score}
 
 
 def grade_task3(
@@ -86,7 +89,7 @@ def grade_task3(
     department = department_score(predicted_department, email)
     summary_value = summary_score(summary, email)
     score = 0.3 * urgency + 0.3 * department + 0.4 * summary_value
-    return score, {"urgency": urgency, "department": department, "summary": summary_value}
+    return max(MIN_SCORE, score), {"urgency": urgency, "department": department, "summary": summary_value}
 
 
 def _tokenize(text: str) -> list[str]:
