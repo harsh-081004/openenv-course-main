@@ -53,6 +53,19 @@ tasks:
       method: POST
       task_id: task-full-triage
       grader_name: grade_task3
+graders:
+  - task_id: task-urgency
+    grader_name: grade_task1
+    endpoint: /grader
+    method: POST
+  - task_id: task-routing
+    grader_name: grade_task2
+    endpoint: /grader
+    method: POST
+  - task_id: task-full-triage
+    grader_name: grade_task3
+    endpoint: /grader
+    method: POST
 tags:
   - openenv
 

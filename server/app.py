@@ -60,6 +60,18 @@ TASK_GRADER_SPECS: Dict[str, Dict[str, object]] = {
 }
 
 
+def _registered_graders() -> List[Dict[str, object]]:
+    return [
+        {
+            "task_id": task.task_id,
+            "name": TASK_GRADER_SPECS.get(task.task_id, {}).get("name", "grade_task3"),
+            "endpoint": "/grader",
+            **TASK_GRADER_SPECS.get(task.task_id, {}),
+        }
+        for task in TASKS
+    ]
+
+
 @app.get("/")
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
@@ -112,21 +124,50 @@ def tasks() -> Dict[str, object]:
         )
         for task in TASKS
     ]
+    graders = _registered_graders()
     grader_count = sum(1 for task in task_infos if task.has_grader and bool(task.grader))
     return {
         "tasks": [task.model_dump() for task in task_infos],
         "action_schema": EmailAction.model_json_schema(),
         "grader_endpoint": "/grader",
         "graded_task_count": grader_count,
+        "graders": graders,
+    }
+
+
+@app.get("/grader")
+def grader_registry() -> Dict[str, object]:
+    graders = _registered_graders()
+    return {
+        "grader_count": len(graders),
+        "task_ids": [grader["task_id"] for grader in graders],
+        "graders": graders,
     }
 
 
 @app.post("/grader", response_model=GraderResponse)
 def grader(request: GraderRequest | None = None) -> GraderResponse:
     payload = request or GraderRequest()
-    score, details = env.grade(action=payload.action, task_id=payload.task_id)
-    task_id = payload.task_id or (payload.action.task_id if payload.action else env.state().task_id)
-    return GraderResponse(task_id=task_id, score=score, details=details)
+    action_payload = payload.action or {}
+    requested_task_id = payload.task_id or str(action_payload.get("task_id") or "").strip() or env.state().task_id
+    if requested_task_id not in {task.task_id for task in TASKS}:
+        requested_task_id = env.state().task_id
+
+    action_model = None
+    if action_payload:
+        action_model = EmailAction(
+            task_id=requested_task_id,
+            urgency=action_payload.get("urgency"),
+            department=action_payload.get("department"),
+            summary=action_payload.get("summary"),
+            queue_position=action_payload.get("queue_position"),
+            escalate=action_payload.get("escalate"),
+            notes=action_payload.get("notes"),
+        )
+
+    score, details = env.grade(action=action_model, task_id=requested_task_id)
+    print(f"[GRADER] task_id={requested_task_id} score={score:.4f} details_keys={list(details.keys())}")
+    return GraderResponse(task_id=requested_task_id, score=score, details=details)
 
 
 @app.post("/baseline")

@@ -119,7 +119,7 @@ class GraderRequest(BaseModel):
     """Request payload for /grader."""
 
     task_id: Optional[str] = None
-    action: Optional[EmailAction] = None
+    action: Optional[Dict[str, object]] = None
 
 
 class GraderResponse(BaseModel):
