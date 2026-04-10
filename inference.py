@@ -60,10 +60,10 @@ def _single_line(text: str) -> str:
 
 
 def _clamp01(value: float) -> float:
-    if value < 0.0:
-        return 0.0
-    if value > 1.0:
-        return 1.0
+    if value <= 0.0:
+        return 0.001
+    if value >= 1.0:
+        return 0.999
     return value
 
 
